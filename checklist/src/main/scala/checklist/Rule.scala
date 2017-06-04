@@ -1,70 +1,98 @@
 package checklist
 
-import cats.{Applicative, Traverse}
-import cats.data.Ior
-import cats.instances.all._
-import cats.syntax.all._
+import cats._
+import cats.data.{Ior, Kleisli}
+import cats.implicits._
 import monocle.{PLens, Lens}
 import scala.language.higherKinds
 import scala.util.matching.Regex
 import Message.{errors, warnings}
 
-sealed abstract class Rule[A, B] {
-  def apply(value: A): Checked[B]
+trait RuleSyntax {
 
-  def map[C](func: B => C): Rule[A, C] =
-    Rule.pure(value => this(value) map func)
+  implicit class AnyRuleOps[A](value: A) {
+    def validate(implicit rule: Rule[A, A]): Checked[A] =
+      rule(value)
+  }
 
-  def contramap[C](func: C => A): Rule[C, B] =
-    Rule.pure(value => this(func(value)))
+  implicit class RuleIdOps[A, B](rule: Rule[A, B]) {
+    def lift[F[_]: Monad] = rule andThenCheck Monad[F[_]].pure
+  }
 
-  def flatMap[C](func: B => Rule[A, C]): Rule[A, C] =
-    Rule.pure(value => this(value) flatMap (func(_)(value)))
+  implicit class CheckedFOps[F[_], A](checked: CheckedF[F, A]) {
+    def mapResult[B](f: A => B)(implicit M: Functor[F]): CheckedF[F, B] = checked.map(_.map(f))
+    def leftMapResult[B](f: Messages => B)(implicit M: Functor[F]): F[B Ior A] = checked.map(_.leftMap(f))
+    def rightMapResult[B](f: A => B)(implicit M: Functor[F]): CheckedF[F, B] = mapResult(f)
 
-  def andThen[C](that: Rule[B, C]): Rule[A, C] =
-    Rule.pure(value => this(value) flatMap (that.apply))
+    def unlift(implicit M: Comonad[F]): Checked[A] = M.extract(checked)
+  }
 
-  def zip[C](that: Rule[A, C]): Rule[A, (B, C)] =
-    Rule.pure { a =>
-      this(a) match {
-        case Ior.Left(msg1) =>
-          that(a) match {
-            case Ior.Left(msg2)    => Ior.left(msg1 concat msg2)
-            case Ior.Both(msg2, c) => Ior.left(msg1 concat msg2)
-            case Ior.Right(c)      => Ior.left(msg1)
-          }
-        case Ior.Both(msg1, b) =>
-          that(a) match {
-            case Ior.Left(msg2)    => Ior.left(msg1 concat msg2)
-            case Ior.Both(msg2, c) => Ior.both(msg1 concat msg2, (b, c))
-            case Ior.Right(c)      => Ior.both(msg1, (b, c))
-          }
-        case Ior.Right(b) =>
-          that(a) match {
-            case Ior.Left(msg2)    => Ior.left(msg2)
-            case Ior.Both(msg2, c) => Ior.both(msg2, (b, c))
-            case Ior.Right(c)      => Ior.right((b, c))
-          }
+  implicit class RuleOps[F[_], A, B](self: RuleF[F, A, B]) {
+    def mapResult[C](f: B => C)(implicit M: Functor[F]) = self.map(_.map(f))
+
+    def zip[C](that: RuleF[F, A, C])(implicit flatMap: FlatMap[F]): RuleF[F, A, (B, C)] =
+      Rule.pure { a =>
+        self(a) flatMap {
+          case Ior.Left(msg1) =>
+            that(a) match {
+              case Ior.Left(msg2)    => Ior.left(msg1 concat msg2)
+              case Ior.Both(msg2, c) => Ior.left(msg1 concat msg2)
+              case Ior.Right(c)      => Ior.left(msg1)
+            }
+          case Ior.Both(msg1, b) =>
+            that(a) match {
+              case Ior.Left(msg2)    => Ior.left(msg1 concat msg2)
+              case Ior.Both(msg2, c) => Ior.both(msg1 concat msg2, (b, c))
+              case Ior.Right(c)      => Ior.both(msg1, (b, c))
+            }
+          case Ior.Right(b) =>
+            that(a) match {
+              case Ior.Left(msg2)    => Ior.left(msg2)
+              case Ior.Both(msg2, c) => Ior.both(msg2, (b, c))
+              case Ior.Right(c)      => Ior.right((b, c))
+            }
+        }
       }
-    }
 
-  def seq[S[_]: Indexable: Traverse]: Rule[S[A], S[B]] =
-    Rule.sequence(this)
+    def flatMapResult[C](f: B => CheckedF[F, C])(implicit M: Monad[F]): RuleF[F, A, C] =
+      self.flatMap(f)
 
-  def opt: Rule[Option[A], Option[B]] =
-    Rule.optional(this)
+    def andThenCheck[F[_]: FlatMap, C](that: RuleF[F, B, C])(implicit M: Monad[F]): RuleF[F, A, C] =
+      self.flatMap(out => out.flatTraverse(that.apply))
 
-  def req: Rule[Option[A], B] =
-    Rule.required(this)
+    def seq[S[_]: Indexable: Traverse](implicit M: Applicative[F]): RuleF[F, S[A], S[B]] =
+      Rule.sequence(self)
 
-  def prefix[P: PathPrefix](prefix: P): Rule[A, B] =
-    Rule.pure(value => this(value) leftMap (_ map (_ prefix prefix)))
+    def opt(implicit M: Monad[F]): RuleF[F, Option[A], Option[B]] =
+      Rule.optional(self)
 
-  def composeLens[S, T](lens: PLens[S, T, A, B]): Rule[S, T] =
-    Rule.pure(value => this(lens.get(value)) map (lens.set(_)(value)))
+    def req(implicit M: Monad[F]): RuleF[F, Option[A], B] =
+      Rule.required(self)
 
-  def at[P: PathPrefix, S, T](prefix: P, lens: PLens[S, T, A, B]): Rule[S, T] =
-    this composeLens lens prefix prefix
+    def prefix[P: PathPrefix](prefix: P)(implicit M: Monad[F]): RuleF[F, A, B] =
+      Rule.pure(value => self(value) leftMapResult (_ map (_.prefix(prefix))))
+
+    def composeLens[S, T](lens: PLens[S, T, A, B])(implicit M: Functor[F]): RuleF[F, S, T] =
+      Rule.pure(value => self(lens.get(value)) mapResult (lens.set(_)(value)))
+
+    def at[P: PathPrefix, S, T](prefix: P, lens: PLens[S, T, A, B])(implicit M: Monad[F]): RuleF[F, S, T] =
+      self composeLens lens prefix prefix
+  }
+
+
+  implicit class Rule1Ops[A](self: Rule[A, A]) {
+    def field[B](path: Path, lens: Lens[A, B])(implicit rule: Rule[B, B]): Rule[A, A] =
+      self andThenCheck rule.at(path, lens)
+
+    def field[B](accessor: A => B)(implicit rule: Rule[B, B]): Rule[A, A] =
+      macro RuleMacros.field[A, B]
+
+    def fieldWith[B](path: Path, lens: Lens[A, B])(implicit builder: A => Rule[B, B]): Rule[A, A] =
+      self andThenCheck Rule.pureId[A, A](value => builder(value).at(path, lens).apply(value))
+
+    def fieldWith[B](accessor: A => B)(implicit builder: A => Rule[B, B]): Rule[A, A] =
+      macro RuleMacros.fieldWith[A, B]
+  }
 }
 
 object Rule extends BaseRules
@@ -72,23 +100,21 @@ object Rule extends BaseRules
   with PropertyRules
   with CollectionRules
   with RuleInstances
-  with Rule1Syntax
 
 trait BaseRules {
   def apply[A]: Rule[A, A] =
-    pure(Ior.right)
+    pureId(Ior.right)
 
-  def pure[A, B](func: A => Checked[B]): Rule[A, B] =
-    new Rule[A, B] {
-      def apply(value: A) =
-        func(value)
-    }
+  def pure[F[_], A, B](func: A => F[Checked[B]]): RuleF[F, A, B] =
+    Kleisli(func)
+
+  def pureId[A, B](func: A => Checked[B]): Rule[A, B] = pure[Id, A, B](func)
 
   def pass[A]: Rule[A, A] =
-    pure(Ior.right)
+    pureId(Ior.right)
 
   def fail[A](messages: Messages): Rule[A, A] =
-    pure(Ior.both(messages, _))
+    pureId(Ior.both(messages, _))
 }
 
 /** Rules that convert one type to another. */
@@ -99,16 +125,16 @@ trait ConverterRules {
     parseInt(errors("Must be a whole number"))
 
   def parseInt(messages: Messages): Rule[String, Int] =
-    pure(value => util.Try(value.toInt).toOption.map(Ior.right).getOrElse(Ior.left(messages)))
+    pureId(value => util.Try(value.toInt).toOption.map(Ior.right).getOrElse(Ior.left(messages)))
 
   val parseDouble: Rule[String, Double] =
     parseDouble(errors("Must be a number"))
 
   def parseDouble(messages: Messages): Rule[String, Double] =
-    pure(value => util.Try(value.toDouble).toOption.map(Ior.right).getOrElse(Ior.left(messages)))
+    pureId(value => util.Try(value.toDouble).toOption.map(Ior.right).getOrElse(Ior.left(messages)))
 
   val trimString: Rule[String, String] =
-    pure(value => Ior.right(value.trim))
+    pureId(value => Ior.right(value.trim))
 }
 
 /** Rules that test a property of an existing value. */
@@ -206,63 +232,63 @@ trait PropertyRules {
 trait CollectionRules {
   self: BaseRules =>
 
-  def optional[A, B](rule: Rule[A, B]): Rule[Option[A], Option[B]] =
-    pure {
-      case Some(value) => rule(value) map (Some(_))
-      case None        => Ior.right(None)
+  import syntax._
+
+  def optional[F[_], A, B](rule: RuleF[F, A, B])(implicit M: Monad[F]): RuleF[F, Option[A], Option[B]] =
+    self.pure {
+      case Some(value) => rule(value) mapResult (Some(_))
+      case None        => Monad[F].pure(Ior.right(None))
     }
 
-  def required[A, B](rule: Rule[A, B]): Rule[Option[A], B] =
+  def required[F[_]: Monad, A, B](rule: RuleF[F, A, B]): RuleF[F, Option[A], B] =
     required(rule, errors("Value is required"))
 
-  def required[A, B](rule: Rule[A, B], messages: Messages): Rule[Option[A], B] =
-    pure {
+  def required[F[_]: Monad, A, B](rule: RuleF[F, A, B], messages: Messages): RuleF[F, Option[A], B] =
+    self.pure[F, Option[A], B] {
       case Some(value) => rule(value)
-      case None        => Ior.left(messages)
+      case None        => Monad[F].pure(Ior.left(messages))
     }
 
-  def sequence[S[_] : Indexable : Traverse, A, B](rule: Rule[A, B]): Rule[S[A], S[B]] =
-    pure { values =>
-      Indexable[S].zipWithIndex(values).map {
+  def sequence[F[_]: Applicative, S[_] : Indexable : Traverse, A, B](rule: RuleF[F, A, B]): RuleF[F, S[A], S[B]] =
+    self.pure { values =>
+      Indexable[S].zipWithIndex(values).traverse {
         case (value, index) =>
-          rule(value) leftMap (_ map (_ prefix index))
-      }.sequenceU
+          rule(value) leftMapResult (_ map (_ prefix index))
+      }.map(_.sequenceU)
     }
 
   def mapValue[A: PathPrefix, B](key: A): Rule[Map[A, B], B] =
     mapValue[A, B](key, errors(s"Value not found"))
 
   def mapValue[A: PathPrefix, B](key: A, messages: Messages): Rule[Map[A, B], B] =
-    pure(map => map.get(key).map(Ior.right).getOrElse(Ior.left(messages map (_ prefix key))))
+    self.pure[Id, Map[A, B], B](map => (map.get(key).map(Ior.right).getOrElse(Ior.left(messages map (_ prefix key)))))
 
-  def mapValues[A: PathPrefix, B, C](rule: Rule[B, C]): Rule[Map[A, B], Map[A, C]] =
-    pure { in: Map[A, B] =>
-      in.toList.map {
-        case (key, value) =>
-          rule.prefix(key).apply(value).map(key -> _)
-      }.sequenceU
-    } map (_.toMap)
+  def mapValues[F[_]: Monad, A: PathPrefix, B, C](rule: RuleF[F, B, C]): RuleF[F, Map[A, B], Map[A, C]] =
+    self.pure { in: Map[A, B] =>
+      in.toList.traverse { case (key, value) =>
+        rule.prefix(key).apply(value).map(_.map(key -> _))
+      }.map(_.sequenceU.map(_.toMap))
+    }
 }
 
 /** Type class instances for Rule */
 trait RuleInstances {
   self: BaseRules =>
 
-  implicit def ruleApplicative[A]: Applicative[Rule[A, ?]] =
-    new Applicative[Rule[A, ?]] {
-      def pure[B](value: B): Rule[A, B] =
-        Rule.pure(_ => Ior.right(value))
+  import syntax._
 
-      def ap[B, C](funcRule: Rule[A, B => C])(argRule: Rule[A, B]): Rule[A, C] =
-        (funcRule zip argRule) map { pair =>
-          val (func, arg) = pair
-          func(arg)
-        }
+  implicit def ruleApplicative[F[_]: Monad, A]: Applicative[RuleF[F, A, ?]] =
+    new Applicative[RuleF[F, A, ?]] {
+      def pure[B](value: B): RuleF[F, A, B] =
+        Rule.pure(_ => Monad[F].pure(Ior.right(value)))
+
+      def ap[B, C](funcRule: RuleF[F, A, B => C])(argRule: RuleF[F, A, B]): RuleF[F, A, C] =
+        (funcRule zip argRule) map { _ map { case (func, arg) => func(arg) } }
 
       override def map[B, C](rule: Rule[A, B])(func: B => C): Rule[A, C] =
-        rule map func
+        rule map (_ map func)
 
-      override def product[B, C](rule1: Rule[A, B], rule2: Rule[A, C]): Rule[A, (B, C)] =
+      override def product[F[_]: FlatMap, B, C](rule1: RuleF[F, A, B], rule2: RuleF[F, A, C]): RuleF[F, A, (B, C)] =
         rule1 zip rule2
     }
 }

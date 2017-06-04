@@ -30,7 +30,9 @@ lazy val checklist = crossProject.
     scalacOptions     ++= Seq(
       "-deprecation",
       "-feature",
-      "-Xfatal-warnings"
+      "-Xfatal-warnings",
+      "-language:higherKinds",
+      "-language:experimental.macros"
     ),
     libraryDependencies ++= Seq(
       compilerPlugin("org.spire-math"  %% "kind-projector" % "0.9.3"),

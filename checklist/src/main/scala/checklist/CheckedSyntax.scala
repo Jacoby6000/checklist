@@ -2,6 +2,7 @@ package checklist
 
 import monocle._
 import scala.language.experimental.macros
+import cats.Monad
 
 trait CheckedSyntax {
   implicit class CheckedOps[A](value: Checked[A]) {
@@ -22,5 +23,7 @@ trait CheckedSyntax {
 
     def hasNoWarnings: Boolean =
       value.left.fold(true)(messages => messages.forall(_.isError))
+
+    def lift[F[_]: Monad] = Monad[F].pure(value)
   }
 }
