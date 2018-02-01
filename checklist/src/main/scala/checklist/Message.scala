@@ -3,34 +3,29 @@ package checklist
 import cats.{Eq, Order}
 import cats.data.NonEmptyList
 
-sealed abstract class Message(val isError: Boolean, val isWarning: Boolean) {
-  def text: String
-  def path: Path
-
-  def prefix[A: PathPrefix](prefix: A): Message = this match {
-    case result @ ErrorMessage(_, path)   => result.copy(path = prefix :: path)
-    case result @ WarningMessage(_, path) => result.copy(path = prefix :: path)
-  }
-}
-
-final case class ErrorMessage(text: String, path: Path = PNil) extends Message(true, false)
-
-final case class WarningMessage(text: String, path: Path = PNil) extends Message(false, true)
-
-object Message extends MessageConstructors with MessageInstances
-
-trait MessageConstructors {
-  def errors[A](head: A, tail: A *)(implicit promoter: ToMessage[A]): NonEmptyList[Message] =
+object Message {
+  def errors[A](head: A, tail: A *)(implicit promoter: ToMessage[A]): ErrorMessages =
     NonEmptyList.of(head, tail : _*).map(promoter.toError)
 
-  def warnings[A](head: A, tail: A *)(implicit promoter: ToMessage[A]): NonEmptyList[Message] =
+  def warnings[A](head: A, tail: A *)(implicit promoter: ToMessage[A]): WarningMessages =
     NonEmptyList.of(head, tail : _*).map(promoter.toWarning)
 }
 
-trait MessageInstances {
+final case class ErrorMessage(text: String, path: Path = PNil)
+object ErrorMessage {
+  implicit def orderChecklistErrorMessage: Order[ErrorMessage] = Order.by[ErrorMessage, Path](_.path)
 
-  implicit def orderChecklistMessage: Order[Message] = Order.by[Message, Path](_.path)
+  implicit def eqChecklistErrorMessage: Eq[ErrorMessage] =
+    Eq.fromUniversalEquals[ErrorMessage]
 
-  implicit def eqChecklistMessage: Eq[Message] =
-    Eq.fromUniversalEquals[Message]
 }
+
+final case class WarningMessage(text: String, path: Path = PNil)
+
+object WarningMessage {
+  implicit def orderChecklistWarningMessage: Order[WarningMessage] = Order.by[WarningMessage, Path](_.path)
+
+  implicit def eqChecklistWarningMessage: Eq[WarningMessage] =
+    Eq.fromUniversalEquals[WarningMessage]
+}
+

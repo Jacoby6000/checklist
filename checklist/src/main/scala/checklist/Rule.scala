@@ -1,7 +1,7 @@
 package checklist
 
 import cats.{Applicative, Monoid, Traverse}
-import cats.data.{Ior, Kleisli}
+import cats.data.{Kleisli}
 import cats.implicits._
 import monocle.PLens
 
@@ -24,7 +24,7 @@ sealed abstract class Rule[A, B] {
    *
    * @tparam A The value to be validated
    */
-  def apply(value: A): Checked[B]
+  def apply(value: A): CheckedRule[B]
 
   def map[C](func: B => C): Rule[A, C] =
     Rule.pure(value => this(value) map func)
@@ -32,14 +32,17 @@ sealed abstract class Rule[A, B] {
   /**
    * Maps the result type with the potential for a failure to occur.
    */
-  def emap[C](func: B => Checked[C]): Rule[A, C] =
+  def emap[C](func: B => CheckedRule[C]): Rule[A, C] =
     Rule.pure(value => this(value) flatMap func)
 
-  def recover(func: Messages => Checked[B]): Rule[A, B] =
-    Rule.pure(value => this(value).fold(func, Ior.right, Ior.both))
+  def recover(func: (ErrorMessages, List[WarningMessage]) => B): Rule[A, B] =
+    Rule.pure(value => this(value).recover(func))
+
+  def recoverWith(func: (ErrorMessages, List[WarningMessage]) => Rule[A, B]): Rule[A, B] =
+    Rule.pure(value => this(value).recoverWith(func(_)(value)))
 
   def mapMessages(func: Messages => Messages): Rule[A, B] =
-    Rule.pure(value => this(value).fold(func andThen Ior.left, Ior.right, (msgs, r) => Ior.both(func(msgs), r)))
+    Rule.pure(value => this(value).fold(func andThen Checked.errored, Checked.succeeded, (msgs, r) => Checked.warned(func(msgs), r)))
 
   def mapEachMessage(func: Message => Message): Rule[A, B] =
     mapMessages(_.map(func))
@@ -58,26 +61,7 @@ sealed abstract class Rule[A, B] {
 
   def zip[C](that: Rule[A, C]): Rule[A, (B, C)] =
     Rule.pure { a =>
-      this(a) match {
-        case Ior.Left(msg1) =>
-          that(a) match {
-            case Ior.Left(msg2)    => Ior.left(msg1 concatNel msg2)
-            case Ior.Both(msg2, _) => Ior.left(msg1 concatNel msg2)
-            case Ior.Right(_)      => Ior.left(msg1)
-          }
-        case Ior.Both(msg1, b) =>
-          that(a) match {
-            case Ior.Left(msg2)    => Ior.left(msg1 concatNel msg2)
-            case Ior.Both(msg2, c) => Ior.both(msg1 concatNel msg2, (b, c))
-            case Ior.Right(c)      => Ior.both(msg1, (b, c))
-          }
-        case Ior.Right(b) =>
-          that(a) match {
-            case Ior.Left(msg2)    => Ior.left(msg2)
-            case Ior.Both(msg2, c) => Ior.both(msg2, (b, c))
-            case Ior.Right(c)      => Ior.right((b, c))
-          }
-      }
+      this(a).combineWith(that(a))((b, c) => (b, c))
     }
 
   def seq[S[_]: Traverse]: Rule[S[A], S[B]] =
@@ -98,7 +82,7 @@ sealed abstract class Rule[A, B] {
   def at[P: PathPrefix, S, T](prefix: P, lens: PLens[S, T, A, B]): Rule[S, T] =
     this composeLens lens prefix prefix
 
-  def kleisli: Kleisli[Checked, A, B] = Kleisli(apply)
+  def kleisli: Kleisli[CheckedRule, A, B] = Kleisli(apply)
 }
 
 object Rule extends BaseRules
@@ -106,25 +90,27 @@ object Rule extends BaseRules
   with PropertyRules
   with CollectionRules
   with RuleInstances
-  with Rule1Syntax
+  with Rule1Syntax {
+
+}
 
 trait BaseRules {
   def apply[A]: Rule[A, A] =
-    pure(Ior.right)
+    pure(Checked.succeeded)
 
-  def pure[A, B](func: A => Checked[B]): Rule[A, B] =
+  def pure[A, B](func: A => CheckedRule[B]): Rule[A, B] =
     new Rule[A, B] {
       def apply(value: A) =
         func(value)
     }
 
-  def fromKleisli[A, B](func: Kleisli[Checked, A, B]): Rule[A, B] = pure(func.apply)
+  def fromKleisli[A, B](func: Kleisli[CheckedRule, A, B]): Rule[A, B] = pure(func.apply)
 
   def pass[A]: Rule[A, A] =
-    pure(Ior.right)
+    pure(Checked.succeeded)
 
   def fail[A](messages: Messages): Rule[A, A] =
-    pure(Ior.both(messages, _))
+    pure(Checked.warned(messages, _))
 }
 
 /** Rules that convert one type to another. */
@@ -135,16 +121,16 @@ trait ConverterRules {
     parseInt(errors("Must be a whole number"))
 
   def parseInt(messages: Messages): Rule[String, Int] =
-    pure(value => util.Try(value.toInt).toOption.map(Ior.right).getOrElse(Ior.left(messages)))
+    pure(value => util.Try(value.toInt).toOption.map(Checked.succeeded).getOrElse(Checked.errored(messages)))
 
   val parseDouble: Rule[String, Double] =
     parseDouble(errors("Must be a number"))
 
   def parseDouble(messages: Messages): Rule[String, Double] =
-    pure(value => util.Try(value.toDouble).toOption.map(Ior.right).getOrElse(Ior.left(messages)))
+    pure(value => util.Try(value.toDouble).toOption.map(Checked.succeeded).getOrElse(Checked.errored(messages)))
 
   val trimString: Rule[String, String] =
-    pure(value => Ior.right(value.trim))
+    pure(value => Checked.succeeded(value.trim))
 }
 
 /** Rules that test a property of an existing value. */
@@ -152,9 +138,9 @@ trait PropertyRules {
   self: BaseRules =>
 
   def test[A](messages: => Messages, strict: Boolean = false)(func: A => Boolean): Rule[A, A] =
-    pure(value => if(func(value)) Ior.right(value) else {
-      if(strict) Ior.left(messages)
-      else Ior.both(messages, value)
+    pure(value => if(func(value)) Checked.succeeded(value) else {
+      if(strict) Checked.errored(messages)
+      else Checked.warned(messages, value)
     })
 
   def testStrict[A](messages: => Messages)(func: A => Boolean): Rule[A, A] =
@@ -309,8 +295,8 @@ trait PropertyRules {
 
   def nonEmptyList[A](messages: Messages): Rule[List[A], NonEmptyList[A]] =
     Rule.pure {
-      case Nil => Ior.left(messages)
-      case h :: t => Ior.right(NonEmptyList(h, t))
+      case Nil => Checked.errored(messages)
+      case h :: t => Checked.succeeded(NonEmptyList(h, t))
     }
 
   def matchesRegex(regex: Regex): Rule[String, String] =
@@ -356,7 +342,7 @@ trait CollectionRules {
   def optional[A, B](rule: Rule[A, B]): Rule[Option[A], Option[B]] =
     pure {
       case Some(value) => rule(value) map (Some(_))
-      case None        => Ior.right(None)
+      case None        => Checked.succeeded(None)
     }
 
   def required[A, B](rule: Rule[A, B]): Rule[Option[A], B] =
@@ -365,7 +351,7 @@ trait CollectionRules {
   def required[A, B](rule: Rule[A, B], messages: Messages): Rule[Option[A], B] =
     pure {
       case Some(value) => rule(value)
-      case None        => Ior.left(messages)
+      case None        => Checked.errored(messages)
     }
 
   def sequence[S[_] : Traverse, A, B](rule: Rule[A, B]): Rule[S[A], S[B]] =
@@ -379,7 +365,7 @@ trait CollectionRules {
     mapValue[A, B](key, errors(s"Value not found"))
 
   def mapValue[A: PathPrefix, B](key: A, messages: Messages): Rule[Map[A, B], B] =
-    pure(map => map.get(key).map(Ior.right).getOrElse(Ior.left(messages map (_ prefix key))))
+    pure(map => map.get(key).map(Checked.succeeded).getOrElse(Checked.errored(messages map (_ prefix key))))
 
   def mapValues[A: PathPrefix, B, C](rule: Rule[B, C]): Rule[Map[A, B], Map[A, C]] =
     pure { in: Map[A, B] =>
@@ -397,7 +383,7 @@ trait RuleInstances {
   implicit def ruleApplicative[A]: Applicative[Rule[A, ?]] =
     new Applicative[Rule[A, ?]] {
       def pure[B](value: B): Rule[A, B] =
-        Rule.pure(_ => Ior.right(value))
+        Rule.pure(_ => Checked.succeeded(value))
 
       def ap[B, C](funcRule: Rule[A, B => C])(argRule: Rule[A, B]): Rule[A, C] =
         (funcRule zip argRule) map { pair =>
