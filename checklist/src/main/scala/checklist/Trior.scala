@@ -1,7 +1,7 @@
 package checklist
 
 import cats.implicits._
-import cats.{Semigroup, Monoid}
+import cats.{Semigroup, Monoid, Monad}
 import scala.util.{Left => SLeft, Right => SRight}
 
 /**
@@ -145,14 +145,18 @@ object Trior {
   def left[L](left: L): Trior[L, Nothing, Nothing] = Left(left)
   def leftWithMiddle[L, M](left: L, middle: M): Trior[L, M, Nothing] = MidLeft(left, middle)
 
-  /*
-  implicit def checkedMonad[L, M]: Monad[Trior[L, M, ?]] =
+  implicit def triorMonad[L, M: Semigroup]: Monad[Trior[L, M, ?]] =
     new Monad[Trior[L, M, ?]] {
       def pure[A](a: A): Trior[L, M, A] = Right(a)
       def map[A, B](fa: Trior[L, M, A])(f: A => B): Trior[L, M, B] = fa.map(f)
-      def flatMap[A, B](fa: Trior[L, M, A])(f: A => Trior[L, M, B]): Trior[L, M, B] = fa.flatMap(f)
+      def flatMap[A, B](fa: Trior[L, M, A])(f: A => Trior[L, M, B]): Trior[L, M, B] =
+        fa.fold(
+          Left(_),
+          MidLeft(_, _),
+          (m, a) => f(a).mapMiddle(m |+| _),
+          f
+        )
     }
-  */
 
   implicit def checkedMonoid[L: Semigroup, M: Semigroup, A](implicit monoid: Monoid[A]): Monoid[Trior[L, M, A]] =
     new Monoid[Trior[L, M, A]] {
